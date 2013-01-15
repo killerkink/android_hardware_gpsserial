@@ -39,13 +39,37 @@
 #include <cutils/sockets.h>
 #include <hardware/gps.h>
 
+/* this is the state of our connection to the qemu_gpsd daemon */
+typedef struct {
+    int                     init;
+    int                     fd;
+    GpsCallbacks            *callbacks;
+    GpsStatus status;
+    pthread_t               thread;
+    int                     control[2];
+} GpsState;
+
+static GpsState  _gps_state[1];
+static int    id_in_fixed[12];
 #define  GPS_DEBUG  0
+
+#define  DFR(...)   LOGD(__VA_ARGS__)
 
 #if GPS_DEBUG
 #  define  D(...)   LOGD(__VA_ARGS__)
 #else
 #  define  D(...)   ((void)0)
 #endif
+
+#define GPS_DEV_SLOW_UPDATE_RATE (10)
+#define GPS_DEV_HIGH_UPDATE_RATE (1)
+
+#define GPS_DEV_LOW_BAUD  (B9600)
+#define GPS_DEV_HIGH_BAUD (B19200)
+  static void gps_dev_init(int fd);
+  static void gps_dev_deinit(int fd);
+  static void gps_dev_start(int fd);
+  static void gps_dev_stop(int fd);
 
 /*****************************************************************/
 /*****************************************************************/
@@ -117,11 +141,10 @@ static Token
 nmea_tokenizer_get( NmeaTokenizer*  t, int  index )
 {
     Token  tok;
-    static const char*  dummy = "";
 
-    if (index < 0 || index >= t->count) {
-        tok.p = tok.end = dummy;
-    } else
+    if (index < 0 || index >= t->count || index >= MAX_NMEA_TOKENS)
+        tok.p = tok.end = "";
+    else
         tok = t->tokens[index];
 
     return tok;
@@ -156,15 +179,14 @@ Fail:
 static double
 str2float( const char*  p, const char*  end )
 {
-    int   result = 0;
-    int   len    = end - p;
-    char  temp[16];
+    size_t len = end - p;
+    char   temp[16];
 
-    if (len >= (int)sizeof(temp))
+    if (len >= sizeof(temp))
         return 0.;
 
     memcpy( temp, p, len );
-    temp[len] = 0;
+    temp[len] = '\0';
     return strtod( temp, NULL );
 }
 
@@ -176,7 +198,8 @@ str2float( const char*  p, const char*  end )
 /*****************************************************************/
 /*****************************************************************/
 
-#define  NMEA_MAX_SIZE  83
+//#define  NMEA_MAX_SIZE  83
+#define  NMEA_MAX_SIZE  255
 
 typedef struct {
     int     pos;
@@ -186,10 +209,35 @@ typedef struct {
     int     utc_day;
     int     utc_diff;
     GpsLocation  fix;
+    GpsSvStatus sv_status;
     gps_location_callback  callback;
     char    in[ NMEA_MAX_SIZE+1 ];
 } NmeaReader;
 
+void update_gps_status(GpsStatusValue val)
+{
+    GpsState*  state = _gps_state;
+    //Should be made thread safe...
+    state->status.status=val;
+    if (state->callbacks->status_cb)
+        state->callbacks->status_cb(&state->status);
+}
+
+void update_gps_svstatus(GpsSvStatus *val)
+{
+    GpsState*  state = _gps_state;
+    //Should be made thread safe...
+    if (state->callbacks->sv_status_cb)
+        state->callbacks->sv_status_cb(val);
+}
+
+void update_gps_location(GpsLocation *fix)
+{
+    GpsState*  state = _gps_state;
+    //Should be made thread safe...
+    if (state->callbacks->location_cb)
+        state->callbacks->location_cb(fix);
+}
 
 static void
 nmea_reader_update_utc_diff( NmeaReader*  r )
@@ -405,6 +453,23 @@ nmea_reader_update_speed( NmeaReader*  r,
     return 0;
 }
 
+static int
+nmea_reader_update_svs( NmeaReader*  r, int inview, int num, int i, Token prn, Token elevation, Token azimuth, Token snr )
+{
+    int o;
+    i = (num - 1)*4 + i;
+    if (i < inview) {
+        r->sv_status.sv_list[i].prn=str2int(prn.p,prn.end);
+        r->sv_status.sv_list[i].elevation=str2int(elevation.p,elevation.end);
+        r->sv_status.sv_list[i].azimuth=str2int(azimuth.p,azimuth.end);
+        r->sv_status.sv_list[i].snr=str2int(snr.p,snr.end);
+        for (o=0;o<12;o++)
+            if (id_in_fixed[o]==str2int(prn.p,prn.end))
+                r->sv_status.used_in_fix_mask |= 1<i ;
+    }
+    return 0;
+}
+
 
 static void
 nmea_reader_parse( NmeaReader*  r )
@@ -414,12 +479,17 @@ nmea_reader_parse( NmeaReader*  r )
     */
     NmeaTokenizer  tzer[1];
     Token          tok;
+    struct timeval tv;
 
     D("Received: '%.*s'", r->pos, r->in);
     if (r->pos < 9) {
         D("Too short. discarded.");
         return;
     }
+
+    gettimeofday(&tv, NULL);
+    if (_gps_state->init)
+        _gps_state->callbacks->nmea_cb(tv.tv_sec*1000+tv.tv_usec/1000, r->in, r->pos);
 
     nmea_tokenizer_init(tzer, r->in, r->in + r->pos);
 #if GPS_DEBUG
@@ -438,7 +508,14 @@ nmea_reader_parse( NmeaReader*  r )
         D("sentence id '%.*s' too short, ignored.", tok.end-tok.p, tok.p);
         return;
     }
-
+/*
+$GPRMC,084537.345,V,,,,,,,270811,,,N*4F
+$GPGGA,084538.353,,,,,0,00,,,M,0.0,M,,0000*51
+$GPGSA,A,1,,,,,,,,,,,,,,,*1E
+$GPGSV,3,1,11,09,80,303,,12,41,229,,15,40,178,,17,39,070,*70
+$GPGSV,3,2,11,22,20,295,,18,18,256,,14,13,317,,26,10,154,*72
+$GPGSV,3,3,11,25,08,234,,28,08,056,,24,04,011,*40
+*/
     // ignore first two characters.
     tok.p += 2;
     if ( !memcmp(tok.p, "GGA", 3) ) {
@@ -459,7 +536,92 @@ nmea_reader_parse( NmeaReader*  r )
         nmea_reader_update_altitude(r, tok_altitude, tok_altitudeUnits);
 
     } else if ( !memcmp(tok.p, "GSA", 3) ) {
-        // do something ?
+          //Satellites are handled by RPC-side code.
+          /*
+          1    = Mode:
+                 M=Manual, forced to operate in 2D or 3D
+                 A=Automatic, 3D/2D
+          2    = Mode:
+                 1=Fix not available
+                 2=2D
+                 3=3D
+          3-14 = IDs of SVs used in position fix (null for unused fields)
+          15   = PDOP
+          16   = HDOP
+          17   = VDOP
+          */
+        Token tok_mode = nmea_tokenizer_get(tzer,1);
+        Token tok_fix  = nmea_tokenizer_get(tzer,2);
+        Token tok_id  = nmea_tokenizer_get(tzer,3);
+        Token tok_pdop = nmea_tokenizer_get(tzer,15);
+        Token tok_hdop = nmea_tokenizer_get(tzer,16);
+        Token tok_vdop = nmea_tokenizer_get(tzer,17);
+        int i;
+        for ( i=0; i<12; i++ ) {
+            Token tok_id  = nmea_tokenizer_get(tzer,3+i);
+            if ( tok_id.end > tok_id.p )
+                id_in_fixed[i]=str2int(tok_id.end, tok_id.p);
+        }
+    } else if ( !memcmp(tok.p, "GSV", 3) ) {
+        //Satellites are handled by RPC-side code.
+        Token tok_num_messages   = nmea_tokenizer_get(tzer,1);
+        Token tok_msg_number     = nmea_tokenizer_get(tzer,2);
+        Token tok_svs_inview     = nmea_tokenizer_get(tzer,3);
+        Token tok_sv1_prn_num    = nmea_tokenizer_get(tzer,4);
+        Token tok_sv1_elevation  = nmea_tokenizer_get(tzer,5);
+        Token tok_sv1_azimuth    = nmea_tokenizer_get(tzer,6);
+        Token tok_sv1_snr        = nmea_tokenizer_get(tzer,7);
+        Token tok_sv2_prn_num    = nmea_tokenizer_get(tzer,8);
+        Token tok_sv2_elevation  = nmea_tokenizer_get(tzer,9);
+        Token tok_sv2_azimuth    = nmea_tokenizer_get(tzer,10);
+        Token tok_sv2_snr        = nmea_tokenizer_get(tzer,11);
+        Token tok_sv3_prn_num    = nmea_tokenizer_get(tzer,12);
+        Token tok_sv3_elevation  = nmea_tokenizer_get(tzer,13);
+        Token tok_sv3_azimuth    = nmea_tokenizer_get(tzer,14);
+        Token tok_sv3_snr        = nmea_tokenizer_get(tzer,15);
+        Token tok_sv4_prn_num    = nmea_tokenizer_get(tzer,16);
+        Token tok_sv4_elevation  = nmea_tokenizer_get(tzer,17);
+        Token tok_sv4_azimuth    = nmea_tokenizer_get(tzer,18);
+        Token tok_sv4_snr        = nmea_tokenizer_get(tzer,19);
+        int num_messages = str2int(tok_num_messages.p,tok_num_messages.end);
+        int msg_number = str2int(tok_msg_number.p,tok_msg_number.end);
+        int svs_inview = str2int(tok_svs_inview.p,tok_svs_inview.end);
+        D("GSV %d %d %d", num_messages, msg_number, svs_inview );
+        if (msg_number==1)
+            r->sv_status.used_in_fix_mask=0;
+        nmea_reader_update_svs( r, svs_inview, msg_number, 0, tok_sv1_prn_num, tok_sv1_elevation, tok_sv1_azimuth, tok_sv1_snr );
+        nmea_reader_update_svs( r, svs_inview, msg_number, 1, tok_sv2_prn_num, tok_sv2_elevation, tok_sv2_azimuth, tok_sv2_snr );
+        nmea_reader_update_svs( r, svs_inview, msg_number, 2, tok_sv3_prn_num, tok_sv3_elevation, tok_sv3_azimuth, tok_sv3_snr );
+        nmea_reader_update_svs( r, svs_inview, msg_number, 3, tok_sv4_prn_num, tok_sv4_elevation, tok_sv4_azimuth, tok_sv4_snr );
+        r->sv_status.num_svs=svs_inview;
+
+        if (num_messages==msg_number)
+            update_gps_svstatus(&r->sv_status);
+          /*
+          1    = Total number of messages of this type in this cycle
+          2    = Message number
+          3    = Total number of SVs in view
+          4    = SV PRN number
+          5    = Elevation in degrees, 90 maximum
+          6    = Azimuth, degrees from true north, 000 to 359
+          7    = SNR, 00-99 dB (null when not tracking)
+          8-11 = Information about second SV, same as field 4-7
+          12-15= Information about third SV, same as field 4-7
+          16-19= Information about fourth SV, same as field 4-7
+          */
+/*
+          int i;
+          _gps_state.sv_status.num_svs=ntohl(data[82]) & 0x1F;
+          for(i=0;i<ret.num_svs;++i) {
+              _gps_state.sv_status.sv_list[i].prn=ntohl(data[83+3*i]);
+              _gps_state.sv_status.sv_list[i].elevation=ntohl(data[83+3*i+1]);
+              _gps_state.sv_status.sv_list[i].azimuth=ntohl(data[83+3*i+2])/100;
+              _gps_state.sv_status.sv_list[i].snr=ntohl(data[83+3*i+2])%100;
+          }
+          _gps_state.sv_status.used_in_fix_mask=ntohl(data[77]);
+          update_gps_svstatus(&_gps_state.
+
+*/
     } else if ( !memcmp(tok.p, "RMC", 3) ) {
         Token  tok_time          = nmea_tokenizer_get(tzer,1);
         Token  tok_fixStatus     = nmea_tokenizer_get(tzer,2);
@@ -513,8 +675,15 @@ nmea_reader_parse( NmeaReader*  r )
         }
         gmtime_r( (time_t*) &r->fix.timestamp, &utc );
         p += snprintf(p, end-p, " time=%s", asctime( &utc ) );
-        D(temp);
 #endif
+       if (_gps_state->callbacks->location_cb) {
+           _gps_state->callbacks->location_cb( &r->fix );
+           r->fix.flags = 0;
+       } else {
+           D("no callback, keeping data until needed !");
+       }
+
+/*
         if (r->callback) {
             r->callback( &r->fix );
             r->fix.flags = 0;
@@ -522,6 +691,7 @@ nmea_reader_parse( NmeaReader*  r )
         else {
             D("no callback, keeping data until needed !");
         }
+*/
     }
 }
 
@@ -566,16 +736,7 @@ enum {
 };
 
 
-/* this is the state of our connection to the serial GPS unit */
-typedef struct {
-    int                     init;
-    int                     fd;
-    GpsCallbacks            callbacks;
-    pthread_t               thread;
-    int                     control[2];
-} GpsState;
 
-static GpsState  _gps_state[1];
 
 
 static void
@@ -715,14 +876,16 @@ gps_state_thread( void*  arg )
                         if (!started) {
                             D("gps thread starting  location_cb=%p", state->callbacks.location_cb);
                             started = 1;
-                            nmea_reader_set_callback( reader, state->callbacks.location_cb );
+                            //nmea_reader_set_callback( reader, state->callbacks.location_cb );
+                            update_gps_status(GPS_STATUS_SESSION_BEGIN);
                         }
                     }
                     else if (cmd == CMD_STOP) {
                         if (started) {
                             D("gps thread stopping");
                             started = 0;
-                            nmea_reader_set_callback( reader, NULL );
+                            //nmea_reader_set_callback( reader, NULL );
+                            update_gps_status(GPS_STATUS_SESSION_END);
                         }
                     }
                 }
@@ -849,7 +1012,7 @@ gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
         goto Fail;
     }
 
-    state->callbacks = *callbacks;
+    state->callbacks = callbacks;
 
     D("gps state initialized");
     return;
